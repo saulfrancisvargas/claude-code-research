@@ -185,33 +185,106 @@ Each sub-agent:
 - Can work in parallel
 - Reports back to the main thread
 
-### 2.6 MCPs vs Skills
+### 2.6 MCPs (Model Context Protocol)
 
-| Concept | Definition | When to Use |
-|---------|------------|-------------|
-| **MCP** (Model Context Protocol) | Connections to external systems (APIs, databases, services) | When you need live external data |
-| **Skills** | Reusable prompts/instructions that teach Claude patterns | Everything else |
+MCPs connect Claude to external systems—databases, APIs, and services. They're powerful but come with context costs.
 
-**Example - MCP:**
+#### When to Use MCPs
+
+| ✅ Use MCP For | ❌ Don't Use MCP For |
+|---------------|---------------------|
+| Live database queries | Static coding patterns |
+| External API calls | Team conventions |
+| Real-time data (stocks, weather) | Workflow instructions |
+| Third-party service integration | Code review checklists |
+| File systems outside the project | Anything you can document |
+
+**Key Principle:** If you can capture the knowledge in a skill or CLAUDE.md, do that instead. MCPs add tools to Claude's context, consuming tokens on every request.
+
+#### MCP Configuration
+
+**Add via CLI:**
+```bash
+# Add a server
+claude mcp add postgres-server npx @anthropic-ai/mcp-postgres
+
+# Add with environment variable
+claude mcp add github-server npx @anthropic-ai/mcp-github -e GITHUB_TOKEN=your-token
+
+# List active servers
+claude mcp list
+
+# Remove a server
+claude mcp remove postgres-server
 ```
-Connecting to your PostgreSQL database to query live data
-Fetching from a REST API
-Reading from a third-party service
+
+**Or configure in `.claude/mcp.json`:**
+```json
+{
+  "mcpServers": {
+    "postgres": {
+      "command": "npx",
+      "args": ["@anthropic-ai/mcp-postgres"],
+      "env": {
+        "DATABASE_URL": "${DATABASE_URL}"
+      }
+    },
+    "github": {
+      "command": "npx",
+      "args": ["@anthropic-ai/mcp-github"],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}"
+      }
+    }
+  }
+}
 ```
 
-**Example - Skill:**
-```markdown
-# .claude/skills/react-component.md
-When creating React components:
-1. Use functional components with hooks
-2. Props interface defined above component
-3. Export as named export
-4. Colocate styles in .module.css file
-```
+#### Popular MCP Servers
 
-**Rule: Use MCPs only when external data is needed. Use skills for everything else.**
+| Server | Purpose | Package |
+|--------|---------|---------|
+| PostgreSQL | Database queries | `@anthropic-ai/mcp-postgres` |
+| GitHub | Issues, PRs, repos | `@anthropic-ai/mcp-github` |
+| Notion | Documents, databases | `@anthropic-ai/mcp-notion` |
+| Slack | Messages, channels | `@anthropic-ai/mcp-slack` |
+| Filesystem | External file access | `@anthropic-ai/mcp-filesystem` |
+| Memory | Persistent key-value store | `@anthropic-ai/mcp-memory` |
 
-### 2.7 Checkpoints
+#### MCP Security
+
+- **Never hardcode credentials** in MCP configs—use environment variables
+- **Scope permissions narrowly** when configuring access
+- **Add MCP servers to .claudeignore** if they contain sensitive paths
+- **Review MCP server code** before running—they execute with your permissions
+- **Use read-only modes** when available for exploration
+
+#### Context Efficiency Hierarchy
+
+When deciding how to give Claude capabilities, prefer this order:
+
+1. **CLAUDE.md** - Static project knowledge (always loaded, ~2500 tokens max)
+2. **Skills** - Procedural knowledge, loads only when relevant
+3. **Commands** - User-invoked workflows, loads only when called
+4. **MCPs** - External data access (adds tools to every request)
+
+**Rule: Skills should be your default. MCPs are for when you truly need external connectivity.**
+
+### 2.7 Skills Overview
+
+Skills teach Claude reusable patterns and workflows through structured markdown files. See [Section 3.6](#36-skills-in-depth) for comprehensive coverage.
+
+Quick comparison:
+
+| Feature | Skills | MCPs |
+|---------|--------|------|
+| Context cost | Low (loads on demand) | High (tools always present) |
+| External data | No | Yes |
+| Offline use | Yes | No |
+| Team sharing | Easy (git) | Requires setup |
+| Best for | Patterns, workflows, standards | Live data, integrations |
+
+### 2.8 Checkpoints
 
 **What they are:** Snapshots of your project state that Claude can create before making changes.
 
@@ -505,33 +578,637 @@ coverage/
 
 ### 3.5 Hooks Configuration
 
-Hooks run automatically before or after Claude performs actions.
+Hooks run automatically at specific points in Claude's workflow—like git hooks, but for Claude actions. They help enforce team standards automatically.
 
-**Configure in `.claude/hooks.json`:**
+#### Hook Types
+
+| Event | When It Fires | Common Uses |
+|-------|---------------|-------------|
+| `PreToolUse` | Before Claude uses any tool | Block dangerous commands, validate inputs |
+| `PostToolUse` | After Claude uses any tool | Format files, run linters |
+| `Notification` | When Claude sends a notification | Custom alerts |
+| `Stop` | When Claude stops executing | Cleanup, summary logging |
+| `SubagentStop` | When a sub-agent completes | Aggregate results |
+
+#### Configuration Format
+
+Configure in `.claude/hooks.json`:
 
 ```json
 {
   "hooks": {
-    "post-write": {
-      "*.ts": "npx prettier --write $FILE",
-      "*.tsx": "npx prettier --write $FILE",
-      "*.js": "npx prettier --write $FILE",
-      "*.json": "npx prettier --write $FILE"
-    },
-    "post-commit": {
-      "*": "npm run lint:fix"
-    },
-    "pre-push": {
-      "*": "npm run test"
-    }
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node .claude/scripts/validate-command.js \"$command\""
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npx prettier --write \"$file_path\""
+          }
+        ]
+      }
+    ]
   }
 }
 ```
 
-This ensures:
-- All code Claude writes is auto-formatted
-- Linting runs after commits
-- Tests run before any push
+#### Essential Hook Examples
+
+**1. Branch Protection (PreToolUse)**
+Prevent accidental commits to protected branches:
+```json
+{
+  "matcher": "Bash",
+  "hooks": [{
+    "type": "command",
+    "command": "if git branch --show-current | grep -qE '^(main|master|production)$'; then echo 'ERROR: Cannot modify protected branch' && exit 1; fi"
+  }]
+}
+```
+
+**2. Auto-Format on Write (PostToolUse)**
+Format files after Claude writes them:
+```json
+{
+  "matcher": "Write|Edit",
+  "hooks": [{
+    "type": "command",
+    "command": "npx prettier --write \"$file_path\" 2>/dev/null || true"
+  }]
+}
+```
+
+**3. TypeScript Check (PostToolUse)**
+Validate TypeScript after changes:
+```json
+{
+  "matcher": "Write|Edit",
+  "hooks": [{
+    "type": "command",
+    "command": "if [[ \"$file_path\" == *.ts || \"$file_path\" == *.tsx ]]; then npx tsc --noEmit \"$file_path\" 2>&1 | head -20; fi"
+  }]
+}
+```
+
+**4. Security Validation (PreToolUse)**
+Block commands containing secrets patterns:
+```json
+{
+  "matcher": "Bash",
+  "hooks": [{
+    "type": "command",
+    "command": "if echo \"$command\" | grep -qiE '(api_key|secret|password)\\s*=\\s*[\"'\\'''][^\"'\\''\"]+[\"'\\'']'; then echo 'ERROR: Possible hardcoded secret detected' && exit 1; fi"
+  }]
+}
+```
+
+**5. Session Setup (Notification)**
+Load context at session start:
+```json
+{
+  "matcher": "session_start",
+  "hooks": [{
+    "type": "command",
+    "command": "cat docs/status.md 2>/dev/null || echo 'No status file found'"
+  }]
+}
+```
+
+**6. TDD Guard (PreToolUse)**
+Require tests before implementation (optional strict mode):
+```json
+{
+  "matcher": "Write|Edit",
+  "hooks": [{
+    "type": "command",
+    "command": "if [[ \"$file_path\" != *test* && \"$file_path\" != *spec* ]]; then echo 'REMINDER: Write tests first (TDD)'; fi"
+  }]
+}
+```
+
+#### Hook Best Practices
+
+- **Quote all variables:** Always use `\"$variable\"` to handle spaces in paths
+- **Fail gracefully:** Use `|| true` for non-critical hooks to avoid blocking Claude
+- **Keep hooks fast:** Slow hooks degrade the experience
+- **Test hooks independently:** Run hook commands manually before adding to config
+- **Log sparingly:** Verbose hooks pollute Claude's context window
+- **Use exit codes:** Exit 1 to block the action, exit 0 to allow
+
+### 3.6 Skills In-Depth
+
+Skills teach Claude reusable patterns through structured folders containing instructions, scripts, and resources. They load dynamically when relevant to the conversation.
+
+#### Skills vs Commands
+
+| Feature | Skills | Commands |
+|---------|--------|----------|
+| **Trigger** | Automatic (based on relevance) | Manual (`/command-name`) |
+| **Purpose** | Teach patterns, domain knowledge | Trigger specific workflows |
+| **Loading** | On-demand when relevant | Only when invoked |
+| **Format** | Folder with SKILL.md | Single .md file |
+| **Best for** | Coding standards, domain expertise | Day-to-day operations |
+
+**Rule of thumb:** If you find yourself typing the same prompt repeatedly, make it a skill. If you need to trigger a workflow explicitly, make it a command.
+
+#### Directory Structure
+
+**Project-level skills** (shared with team via git):
+```
+.claude/
+  skills/
+    code-review/
+      SKILL.md
+    git-commit/
+      SKILL.md
+    api-design/
+      SKILL.md
+      reference/
+        patterns.md
+      templates/
+        openapi.yaml
+```
+
+**Global skills** (personal, all projects):
+```
+~/.claude/
+  skills/
+    my-personal-skill/
+      SKILL.md
+```
+
+#### SKILL.md Format
+
+```yaml
+---
+name: skill-name
+description: Brief discovery description (this triggers auto-loading)
+---
+
+# Detailed Instructions
+
+Your comprehensive instructions here. This section should cover:
+- What the skill does
+- Step-by-step procedures
+- Rules and constraints
+
+# Usage Examples
+
+Show concrete examples of how to use this skill.
+
+# Reference
+
+Link to additional resources in the skill folder if needed.
+```
+
+**Key Points:**
+- The `description` field is critical—it determines when Claude loads the skill
+- Keep the total SKILL.md under 500 lines (aim for <5k tokens)
+- Use the `reference/` subfolder for detailed documentation that loads on demand
+
+#### Context Efficiency
+
+Skills use progressive disclosure:
+1. **Metadata (~100 tokens)** loads first for relevance matching
+2. **Full instructions (<5k tokens)** load when skill is applicable
+3. **Reference files** load only when explicitly needed
+
+This means skills are much more context-efficient than putting everything in CLAUDE.md.
+
+---
+
+#### Example Skill 1: Code Review
+
+```markdown
+---
+name: code-review
+description: Review code for team standards, security, and best practices
+---
+
+# Code Review Skill
+
+You are a thorough code reviewer focusing on quality, security, and maintainability.
+
+## Review Checklist
+
+When reviewing code, check:
+
+### Code Quality
+- [ ] Functions are small and single-purpose
+- [ ] Variable names are clear and descriptive
+- [ ] No magic numbers (use constants)
+- [ ] No commented-out code
+- [ ] DRY principle followed
+
+### TypeScript/JavaScript
+- [ ] No `any` types (use proper types)
+- [ ] Async/await used correctly
+- [ ] Error handling is present
+- [ ] No console.logs left behind
+
+### Security
+- [ ] No hardcoded secrets
+- [ ] User input is validated
+- [ ] SQL queries are parameterized
+- [ ] XSS vectors are escaped
+
+### Testing
+- [ ] New code has tests
+- [ ] Edge cases are covered
+- [ ] Tests are meaningful (not just coverage)
+
+## Output Format
+
+Format your review as:
+
+    ## Summary
+    [1-2 sentence overview]
+
+    ## Issues Found
+    ### Critical
+    - [Issue]: [File:Line] - [Explanation]
+
+    ### Warnings
+    - [Issue]: [File:Line] - [Explanation]
+
+    ### Suggestions
+    - [Improvement]: [File:Line] - [Explanation]
+
+    ## Approval Status
+    [ ] Approved / [ ] Needs Changes
+
+## Usage
+
+Invoke with: `/review` or ask "review this code"
+```
+
+---
+
+#### Example Skill 2: Git Commit
+
+```markdown
+---
+name: git-commit
+description: Generate commit messages following team conventions
+---
+
+# Git Commit Skill
+
+Generate consistent, descriptive commit messages following conventional commits.
+
+## Commit Format
+
+    <type>(<scope>): <subject>
+
+    <body>
+
+    <footer>
+
+## Types
+
+| Type | When to Use |
+|------|-------------|
+| `feat` | New feature |
+| `fix` | Bug fix |
+| `refactor` | Code change that neither fixes nor adds |
+| `docs` | Documentation only |
+| `style` | Formatting, missing semicolons |
+| `test` | Adding or updating tests |
+| `chore` | Maintenance, dependencies |
+| `perf` | Performance improvement |
+
+## Rules
+
+1. Subject line: Max 50 characters, imperative mood ("Add" not "Added")
+2. Body: Wrap at 72 characters, explain what and why
+3. Footer: Reference issues (Fixes #123, Closes #456)
+
+## Process
+
+1. Run `git diff --staged` to see changes
+2. Analyze what changed and why
+3. Determine the appropriate type
+4. Write a clear subject line
+5. Add body if changes are complex
+6. Add footer with issue references
+
+## Example Output
+
+    feat(auth): add password reset functionality
+
+    Implement password reset flow with email verification.
+    Users can now request a reset link valid for 24 hours.
+
+    - Add /reset-password endpoint
+    - Create email template for reset link
+    - Add rate limiting (3 attempts per hour)
+
+    Closes #234
+```
+
+---
+
+#### Example Skill 3: Project Memory
+
+```markdown
+---
+name: project-memory
+description: Persist context across sessions using docs/status.md
+---
+
+# Project Memory Skill
+
+Maintain persistent context across Claude sessions using the external memory system.
+
+## Memory Locations
+
+| File | Purpose | Update Frequency |
+|------|---------|------------------|
+| `docs/status.md` | Current work status | Every session |
+| `docs/tech-debt.md` | Known debt items | When identified |
+| `docs/decisions/` | Architecture decisions | When made |
+
+## Status File Format
+
+    # Project Status
+
+    ## Last Updated
+    [Date and time]
+
+    ## Current Focus
+    [What we're actively working on]
+
+    ## In Progress
+    - [ ] Task 1 - [status notes]
+    - [ ] Task 2 - [status notes]
+
+    ## Completed This Week
+    - [x] Completed task 1
+    - [x] Completed task 2
+
+    ## Blockers
+    - [Blocker description and what's needed to unblock]
+
+    ## Context for Next Session
+    - [Important context the next session should know]
+    - [Recent decisions or changes]
+
+## Session Start Routine
+
+1. Read `docs/status.md` for last known state
+2. Run `git log --oneline -10` for recent commits
+3. Check `git status` for uncommitted work
+4. Summarize current state before proceeding
+
+## Session End Routine
+
+1. Summarize what was accomplished
+2. Note any incomplete work
+3. Document decisions made
+4. Update `docs/status.md`
+5. Commit changes with descriptive message
+```
+
+---
+
+#### Example Skill 4: Deployment Checklist
+
+```markdown
+---
+name: deployment-checklist
+description: Pre-deployment verification steps and checks
+---
+
+# Deployment Checklist Skill
+
+Verify code is ready for deployment through systematic checks.
+
+## Pre-Deploy Checklist
+
+### Code Quality
+- [ ] All tests pass (`npm test`)
+- [ ] No TypeScript errors (`npm run build`)
+- [ ] Linting passes (`npm run lint`)
+- [ ] No console.logs or debugger statements
+
+### Security
+- [ ] No hardcoded secrets in code
+- [ ] Environment variables documented
+- [ ] No new dependencies with vulnerabilities (`npm audit`)
+- [ ] Sensitive routes are protected
+
+### Database
+- [ ] Migrations are reversible
+- [ ] No destructive migrations without approval
+- [ ] Indexes added for new queries
+
+### Configuration
+- [ ] Environment variables updated in deployment config
+- [ ] Feature flags configured correctly
+- [ ] API keys rotated if compromised
+
+### Documentation
+- [ ] README updated if setup changed
+- [ ] API documentation updated
+- [ ] CHANGELOG updated
+
+### Verification Steps
+
+1. **Build Check**
+       npm run build
+
+2. **Test Suite**
+       npm test
+
+3. **Security Audit**
+       npm audit
+
+4. **Environment Diff**
+   Compare `.env.example` with production config
+
+## Post-Deploy Verification
+
+- [ ] Health check endpoints responding
+- [ ] Core user flows working
+- [ ] Error tracking operational
+- [ ] Logs showing expected activity
+```
+
+---
+
+#### Example Skill 5: Documentation
+
+```markdown
+---
+name: documentation
+description: Write clear documentation following team standards
+---
+
+# Documentation Skill
+
+Write clear, useful documentation that helps future developers.
+
+## Documentation Types
+
+| Type | Location | Purpose |
+|------|----------|---------|
+| API docs | `docs/api/` | Endpoint reference |
+| Architecture | `docs/architecture/` | System design |
+| Guides | `docs/guides/` | How-to tutorials |
+| ADRs | `docs/decisions/` | Decision records |
+
+## Writing Principles
+
+1. **Lead with the "why"** - Explain purpose before details
+2. **Show, don't just tell** - Include examples
+3. **Keep it scannable** - Use headers, lists, tables
+4. **Maintain it** - Outdated docs are worse than none
+
+## ADR Template
+
+    # [Number]. [Title]
+
+    ## Status
+    [Proposed | Accepted | Deprecated | Superseded]
+
+    ## Context
+    [Why we need to make this decision]
+
+    ## Decision
+    [What we decided]
+
+    ## Consequences
+    [What this means going forward]
+
+## API Documentation Template
+
+    # [Endpoint Name]
+
+    ## Description
+    [What this endpoint does]
+
+    ## Request
+    [METHOD] /path/{param}
+
+    ### Parameters
+    | Name | Type | Required | Description |
+
+    ### Body
+    [Request body schema]
+
+    ## Response
+
+    ### Success (200)
+    [Response schema]
+
+    ### Errors
+    | Code | Description |
+
+    ## Example
+    [Curl example or code snippet]
+
+## Code Comments
+
+- **Do** explain "why", not "what"
+- **Don't** comment obvious code
+- **Do** document public APIs
+- **Don't** leave TODO comments indefinitely
+```
+
+---
+
+#### Example Skill 6: Data Analysis
+
+```markdown
+---
+name: data-analysis
+description: Query and analyze data from databases and data warehouses
+---
+
+# Data Analysis Skill
+
+Help with database queries, data analysis, and insights generation.
+
+## Query Patterns
+
+### BigQuery
+
+    -- Standard pattern for time-series analysis
+    SELECT
+      DATE_TRUNC(created_at, DAY) as date,
+      COUNT(*) as count,
+      COUNT(DISTINCT user_id) as unique_users
+    FROM project.dataset.table
+    WHERE created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+    GROUP BY 1
+    ORDER BY 1 DESC
+
+### PostgreSQL
+
+    -- Pagination with cursor
+    SELECT *
+    FROM users
+    WHERE id > :cursor
+    ORDER BY id
+    LIMIT :page_size
+
+## Analysis Workflow
+
+1. **Understand the question** - What insight is needed?
+2. **Identify data sources** - Which tables/views?
+3. **Write exploratory query** - Sample data first
+4. **Validate results** - Sanity check counts
+5. **Optimize if needed** - Add indexes, limit scans
+6. **Document findings** - Clear summary with caveats
+
+## Best Practices
+
+- Always include a `LIMIT` during exploration
+- Use CTEs for readability
+- Comment complex queries
+- Validate row counts at each step
+- Be aware of NULL handling
+
+## Common Pitfalls
+
+| Issue | Solution |
+|-------|----------|
+| Missing NULLs | Use `COALESCE` or explicit NULL checks |
+| Timezone confusion | Always use UTC, convert at display |
+| Cartesian joins | Verify join conditions |
+| Slow queries | Check EXPLAIN, add indexes |
+```
+
+---
+
+#### Skill Best Practices
+
+1. **Keep skills focused** - One skill, one purpose
+2. **Description is critical** - It triggers auto-loading
+3. **Under 500 lines** - Split large skills into base + reference files
+4. **Include examples** - Show don't tell
+5. **Test before sharing** - Verify the skill works as expected
+6. **Version with git** - Track changes to skills
+
+#### Creating Skills: Automated Method
+
+Use the built-in skill creator:
+```
+You: Use /skill-creator to help me build a skill for [your task]
+```
+
+Claude will guide you through an interactive process to create a complete skill.
 
 ---
 
@@ -917,11 +1594,11 @@ Focus on:
 - Style consistency with our codebase
 ```
 
-## 5.5 Advanced Workflows
+### 5.6 Advanced Workflows
 
 Different situations call for different approaches. This section covers proven workflow patterns your team can adopt based on the type of work you're doing.
 
-### 5.5.1 The Orchestrator Pattern
+#### 5.6.1 The Orchestrator Pattern
 
 **What it is:** Your main Claude thread acts purely as a coordinator—it doesn't write code itself. Instead, it creates and manages sub-agents, each handling specific tasks. The main thread synthesizes results.
 
@@ -996,7 +1673,7 @@ When acting as orchestrator:
 
 ---
 
-### 5.5.2 Parallel vs Sequential Sub-Agents
+#### 5.6.2 Parallel vs Sequential Sub-Agents
 
 Not all sub-agent work can run in parallel. Use this decision framework:
 
@@ -1048,7 +1725,7 @@ Wait for all to complete, then review for integration issues.
 
 ---
 
-### 5.5.3 The 3 Amigos Pattern
+#### 5.6.3 The 3 Amigos Pattern
 
 **What it is:** Three specialized agents working in sequence—PM Agent → UX Agent → Implementation Agent—each building on the previous output.
 
@@ -1112,7 +1789,7 @@ Run each step as a sub-agent. Do not proceed to the next step until I approve.
 
 ---
 
-### 5.5.4 Domain-Based Splitting
+#### 5.6.4 Domain-Based Splitting
 
 **What it is:** Assign sub-agents based on architectural domains, each owning their vertical slice.
 
@@ -1159,7 +1836,7 @@ Run database first (they depend on schema).
 
 ---
 
-### 5.5.5 Research-Plan-Execute Pattern
+#### 5.6.5 Research-Plan-Execute Pattern
 
 **What it is:** Dedicated research phase before planning, especially useful for unfamiliar territory.
 
@@ -1217,7 +1894,7 @@ Implement according to approved plan.
 
 ---
 
-### 5.5.6 Quality Gate Pattern
+#### 5.6.6 Quality Gate Pattern
 
 **What it is:** Mandatory verification sub-agents that run after implementation.
 
@@ -1263,7 +1940,7 @@ You: /quality-gates
 
 ---
 
-### 5.5.7 Workflow Selection Guide
+#### 5.6.7 Workflow Selection Guide
 
 | Situation | Recommended Workflow |
 |-----------|---------------------|
@@ -1278,7 +1955,7 @@ You: /quality-gates
 
 ---
 
-### 5.5.8 Anti-Patterns to Avoid
+#### 5.6.8 Anti-Patterns to Avoid
 
 **❌ Over-parallelizing:**
 Spawning 10 agents for a simple feature wastes tokens and creates coordination overhead.
@@ -1305,7 +1982,7 @@ Shipping sub-agent code without running tests or quality gates.
 
 ---
 
-### 5.5.9 Template: Orchestrator Mode Prompt
+#### 5.6.9 Template: Orchestrator Mode Prompt
 
 Save this as a /command for easy access:
 
@@ -1334,7 +2011,7 @@ Routing rules:
 Begin by outputting your orchestration plan. Wait for approval before spawning agents.
 ```
 
-### 5.5.10 Worktree Manager Skill
+#### 5.6.10 Worktree Manager Skill
 
 Create this file at `.claude/skills/worktree-manager/SKILL.md`:
 
@@ -1468,7 +2145,7 @@ npm run dev -- -p 3001
 5. **Remind users about ports** if they're running multiple dev servers
 ````
 
-### 5.5.11 The Worktree Manager Workflow
+#### 5.6.11 The Worktree Manager Workflow
 
 **What it is:** A workflow pattern where your main Claude thread acts as a manager that creates isolated git worktrees and spawns separate Claude Code instances in new terminal windows.
 
@@ -1766,7 +2443,7 @@ Make sure you're running PowerShell as your shell. The command `Start-Process po
 
 Make sure Terminal.app has permissions in System Preferences → Security & Privacy → Automation.
 
-### 5.6 Sub-Agent Workflows
+### 5.7 Sub-Agent Workflows
 
 #### Setting Up the Simplifier Agent
 
@@ -1806,7 +2483,7 @@ You: I've finished the feature. Run the following in sequence:
 Don't modify anything the simplifier suggests until I approve.
 ```
 
-### 5.7 Background Agents for Long Tasks
+### 5.8 Background Agents for Long Tasks
 
 For tasks that take a long time:
 
@@ -1823,7 +2500,7 @@ You: /status
 What's the progress on the background migration task?
 ```
 
-### 5.8 End-of-Session Ritual
+### 5.9 End-of-Session Ritual
 
 Before ending a session, always:
 
